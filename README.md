@@ -433,6 +433,175 @@ Catatan keamanan:
 
 - Endpoint ini hanya boleh dipanggil dari backend karena API key berada di query string, yang berpotensi tertulis di access log jika tidak disanitasi. [1][2]
 
+### 3.10 Mode Sandbox & Payment Simulator
+
+Sandbox adalah mode uji coba. Transaksi yang terjadi di mode ini **tidak** masuk ke saldo utama, dan QRIS/Virtual Account yang dibuat **tidak bisa** di-scan atau ditransfer. Production adalah mode produksi: transaksi masuk ke saldo utama dan diproses oleh sistem.
+
+**Penting:** `pakasir-go-sdk` tidak memiliki "mode switch". Mode (Sandbox vs Production) ditentukan oleh **project Pakasir** yang dipakai (pasangan `slug` + `api_key`). Oleh karena itu, Bu Kasir menyimpan konfigurasi mode sendiri untuk gating internal:
+
+```bash
+export PAKASIR_MODE=sandbox   # sandbox | production (default: production)
+```
+
+Gunakan slug + API key project Sandbox saat `PAKASIR_MODE=sandbox`, dan project Production saat `PAKASIR_MODE=production`.
+
+Saat project masih di mode Sandbox, Anda dapat melakukan simulasi pembayaran untuk menguji webhook tanpa pembayaran nyata. SDK menyediakan `simulation.Service`: [2]
+
+```go
+import "github.com/H0llyW00dzZ/pakasir-go-sdk/src/simulation"
+
+simService := simulation.NewService(c)
+
+func SimulatePayment(ctx context.Context, orderID string, amount int64) error {
+    // Hanya boleh dipanggil saat PAKASIR_MODE=sandbox.
+    return simService.Pay(ctx, &simulation.PayRequest{
+        OrderID: orderID,
+        Amount:  amount,
+    })
+}
+```
+
+Endpoint internal yang disarankan: `POST /api/payments/{order_id}/simulate`.
+
+- Endpoint ini **hanya aktif** saat `PAKASIR_MODE=sandbox`; di mode production kembalikan `403`/`404`.
+- `simulation.Service.Pay` memanggil `POST /api/paymentsimulation` dan memicu webhook seolah pembayaran nyata selesai. [1][2]
+- Simulasi hanya bekerja untuk transaksi berstatus `pending` di project Sandbox.
+
+**Guardrail fulfillment:** webhook yang dihasilkan simulasi memiliki flag `Event.IsSandbox == true`. Jangan pernah memicu fulfillment nyata (kirim barang, potong stok permanen) untuk event sandbox — cukup update status untuk keperluan tes. Tandai juga order yang lahir di sandbox (mis. kolom `is_sandbox` pada tabel `orders`).
+
+### 3.11 Fee By Merchant
+
+Secara default, biaya transaksi (`fee`) dibebankan kepada **pembeli**. Jika fitur **Fee By Merchant** diaktifkan, biaya transaksi dibebankan kepada **Anda sebagai merchant**.
+
+**Penting:** Fee By Merchant **bukan** parameter API atau field SDK. Ini adalah **setting di dashboard Pakasir (Edit Proyek)**. Efeknya hanya terlihat dari response `Transaction Create` melalui field `amount`, `fee`, dan `total_payment` (= `amount` + `fee`). [1]
+
+Agar logika tampilan dan rekonsiliasi konsisten dengan setting dashboard, Bu Kasir menyimpan cerminan konfigurasi:
+
+```bash
+export PAKASIR_FEE_BY_MERCHANT=false   # true | false (samakan dengan setting dashboard)
+```
+
+Logika penentuan nominal:
+
+| Fee By Merchant | Pembeli membayar | Merchant terima (net) | Yang ditampilkan ke pembeli |
+|---|---|---|---|
+| OFF (default) | `total_payment` (= amount + fee) | `amount` | `total_payment` |
+| ON | `amount` | `amount - fee` | `amount` |
+
+Dari response `Create`, selain menyimpan `amount`, `fee`, `total_payment`, hitung dan simpan turunan:
+
+- `customer_charge` = (Fee By Merchant ON ? `amount` : `total_payment`) — nominal yang ditampilkan ke pembeli / POS.
+- `merchant_net` = (Fee By Merchant ON ? `amount - fee` : `amount`) — nominal untuk laporan & rekonsiliasi.
+
+**Catatan validasi:** webhook dan Transaction Detail dari Pakasir selalu mengirim `amount` (nominal asli), **bukan** `customer_charge`. Saat mencocokkan webhook dengan order internal, gunakan `amount` asli. Disarankan menambahkan log peringatan bila `fee`/`total_payment` dari Pakasir tidak konsisten dengan asumsi `PAKASIR_FEE_BY_MERCHANT` (deteksi drift setting dashboard).
+
+### 3.12 Webhook URL (Konfigurasi & Pengetatan)
+
+Webhook URL adalah URL endpoint di server Anda yang dipanggil oleh sistem Pakasir saat transaksi terbayar (`completed`). URL ini diisi melalui form **Edit Proyek** di dashboard Pakasir, contoh: `https://<domain-bukasir>/webhook/pakasir`. [1]
+
+Penanganan webhook dasar sudah dijelaskan di §3.7. Berikut pengetatan yang disarankan untuk produksi:
+
+```go
+import (
+    "github.com/H0llyW00dzZ/pakasir-go-sdk/src/webhook"
+    "github.com/H0llyW00dzZ/pakasir-go-sdk/src/constants"
+)
+
+func PakasirWebhookHandler(w http.ResponseWriter, r *http.Request) {
+    // 1. Batasi ukuran body (default SDK 1 MB; perketat sesuai kebutuhan).
+    event, err := webhook.ParseRequest(r, webhook.WithMaxBodySize(64<<10))
+    if err != nil {
+        http.Error(w, "request tidak valid", http.StatusBadRequest)
+        return
+    }
+
+    // 2. Sanity-check field webhook (order_id non-empty, amount > 0).
+    if err := event.Validate(); err != nil {
+        http.Error(w, "payload tidak valid", http.StatusBadRequest)
+        return
+    }
+
+    // 3. Lookup + cocokkan order_id & amount (asli) terhadap data internal.
+    order, err := findOrderByExternalOrderID(event.OrderID)
+    if err != nil {
+        http.Error(w, "order tidak ditemukan", http.StatusBadRequest)
+        return
+    }
+    if event.Amount != order.ExternalAmount {
+        http.Error(w, "amount tidak cocok", http.StatusBadRequest)
+        return
+    }
+
+    // 4. Routing mode: jangan fulfillment nyata untuk event sandbox.
+    if event.IsSandbox {
+        _ = markOrderStatus(order.ID, event.Status) // update status saja
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+
+    // 5. Idempotensi: lewati jika order sudah completed (webhook bisa terkirim >1x).
+    if order.ExternalStatus == string(constants.StatusCompleted) {
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+
+    // 6. (Disarankan) verifikasi ulang via Transaction Detail API sebelum fulfillment.
+    //    detail, err := txnService.Detail(ctx, &transaction.DetailRequest{...})
+
+    // 7. Update status & fulfillment.
+    if event.Status == constants.StatusCompleted {
+        if err := markOrderAsPaid(order.ID); err != nil {
+            http.Error(w, "gagal update order", http.StatusInternalServerError)
+            return
+        }
+    }
+
+    // 8. Balas 200 cepat; proses berat (email, dsb.) sebaiknya async.
+    w.WriteHeader(http.StatusOK)
+}
+```
+
+Struktur payload webhook (dari docs): [1]
+
+```json
+{
+  "amount": 22000,
+  "order_id": "240910HDE7C9",
+  "project": "depodomain",
+  "status": "completed",
+  "payment_method": "qris",
+  "completed_at": "2024-09-10T08:07:02.819+07:00"
+}
+```
+
+SDK juga membaca field `is_sandbox` ke `Event.IsSandbox`. Docs Pakasir menyarankan tetap melakukan pengecekan status yang lebih valid melalui Transaction Detail API, karena webhook saja tidak cukup untuk memicu fulfillment. [1]
+
+### 3.13 Menjalankan Scaffold (`main.go`)
+
+Repo ini menyertakan scaffold implementasi satu file ([`main.go`](main.go)) yang menerapkan ketiga fitur di atas. Scaffold menyimpan order di memory (bukan database) agar mudah dijalankan untuk demo; ganti `orderStore` dengan implementasi berbasis database dan tambahkan autentikasi pada endpoint internal sebelum dipakai produksi.
+
+```bash
+export PAKASIR_PROJECT=my-project-slug
+export PAKASIR_API_KEY=your_api_key_here
+export PAKASIR_MODE=sandbox            # sandbox | production (default: production)
+export PAKASIR_FEE_BY_MERCHANT=false   # samakan dengan setting dashboard
+# opsional: BUKASIR_ADDR (default :8080), PAKASIR_BASE_URL (default https://app.pakasir.com)
+
+go run .
+```
+
+Endpoint yang diekspos:
+
+| Method & Path | Fungsi |
+|---|---|
+| `POST /api/payments` | Buat transaksi (body: `order_id`, `amount`, opsional `method`) |
+| `GET /api/payments/{order_id}` | Ambil status (verifikasi via Detail API) |
+| `POST /api/payments/{order_id}/cancel` | Batalkan transaksi |
+| `POST /api/payments/{order_id}/simulate` | Simulasi pembayaran (hanya mode `sandbox`) |
+| `GET /api/payments/{order_id}/qr` | Render QR PNG (QRIS) |
+| `POST /webhook/pakasir` | Terima webhook Pakasir |
+| `GET /healthz` | Health check |
+
 ---
 
 ## 4. Catatan Keamanan
